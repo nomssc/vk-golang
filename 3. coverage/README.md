@@ -70,3 +70,74 @@ go test -coverprofile=cover.out && go tool cover -html=cover.out -o cover.html
 - Вы можете не ограничиваться функцией `SearchServer` при тестировании, если надо проверить какой-то совсем отдельный хитрый кейс, вроде ошибки. Но таких случаев будет немного. В основном всё будет в `SearchServer`.
 - Для покрытия тестом одной из ошибок придётся залезть в исходники функции, которая возвращает эту ошибку, и посмотреть, при каких условиях работы или входных данных это происходит.
 - Производительность, горутины и прочий асинхрон в этом задании не нужны.
+
+## Решение
+
+Решение написано на языке **Go (Golang)** в двух файлах: `server.go` (сервер) и `coverage_test.go` (тесты). Используется только стандартная библиотека (`net/http`, `encoding/json`, `encoding/xml`, `os`, `sort`, `strconv`, `strings`, `errors`, `io`, `log`). Файл `client.go` не менялся.
+
+Идея: `SearchServer` — тонкий обработчик, который пропускает запрос через цепочку маленьких функций, каждая из которых отвечает за одно действие: `parseParams → loadUsers → filterUsers → sortUsers → paginate → sendJSON`. Такое разбиение позволяет легко проверить каждую ветку, в том числе негативные сценарии.
+
+### 1. `SearchServer`: порядок обработки запроса
+
+1. **Авторизация.** Заголовок `AccessToken` должен быть равен константе `validAccessToken` (`good_token`), иначе сервер отвечает `401` без тела. Клиент превращает это в ошибку `bad AccessToken`.
+2. **Параметры.** `parseParams` проверяет `limit`, `offset`, `order_by`, `order_field`. При ошибке — `400` и JSON `SearchErrorResponse{Error: ...}`.
+3. **Данные.** `loadUsers(datasetPath)` читает `dataset.xml`. Если файл не открывается или XML битый — ошибка пишется в лог и возвращается `500` (клиент: `SearchServer fatal error`).
+4. **Обработка.** Фильтрация по `query`, сортировка, выбор страницы.
+5. **Ответ.** `sendJSON` отправляет `200` и JSON-массив пользователей.
+
+### 2. Параметры запроса (`parseParams`)
+
+| Параметр | Что допустимо | Ошибка (`400`) |
+|----------|---------------|----------------|
+| `limit` | целое число ≥ 0, обязателен | `limit invalid` |
+| `offset` | целое число ≥ 0, обязателен | `offset invalid` |
+| `order_by` | `1`, `0` или `-1`, обязателен | `OrderBy invalid` |
+| `order_field` | пусто, `id`, `age`, `name` в любом регистре; пусто означает `name` | `OrderField invalid` |
+| `query` | любая строка, в том числе пустая | — |
+
+Проверки идут в порядке `limit → offset → order_by → order_field`, возвращается первая найденная ошибка. Для неизвестного `order_field` используется именно константа `ErrorBadOrderField`: по ней клиент превращает ответ в ошибку `OrderFeld ... invalid`. Параметры `limit`, `offset` и `order_by` обязательны, потому что клиент всегда их отправляет.
+
+### 3. Чтение XML (`loadUsers`)
+
+- Файл разбирается потоково через `xml.NewDecoder(f).Decode(...)`, без `io.ReadAll` (как и советует условие).
+- Структуры `xmlRow` и `xmlRoot` описывают только нужные поля (`id`, `age`, `first_name`, `last_name`, `gender`, `about`), остальные элементы XML игнорируются.
+- `Name` собирается как `first_name + " " + last_name`.
+- Путь к файлу вынесен в переменную пакета `datasetPath`, поэтому тесты могут подменить его на несуществующий или сломанный файл.
+
+### 4. Фильтрация, сортировка, пагинация
+
+- **`filterUsers`:** оставляет пользователей, у которых `Name` или `About` содержит `query` (с учётом регистра). Пустой `query` — без фильтрации.
+- **`sortUsers`:** `sort.SliceStable` по `id`, `age` или `name`; для `OrderByDesc` функция сравнения «разворачивается»; для `OrderByAsIs` порядок из файла сохраняется. Сортировка стабильная, поэтому при равных ключах (например, одинаковом возрасте) порядок записей из файла не меняется.
+- **`paginate`:** возвращает срез `[offset, offset+limit)`, обрезанный по длине данных. Если `offset` за концом — пустой, но не `nil` срез, поэтому в JSON получается `[]`, а не `null`.
+
+С клиентом это работает так: он увеличивает `limit` на 1 (и обрезает его до 25), а по тому, пришла ли лишняя запись, определяет `NextPage`.
+
+### 5. Ответ (`sendJSON`)
+
+Функция сериализует значение через `json.Marshal`; при ошибке отвечает `500`. Затем выставляет `Content-Type: application/json`, пишет статус и тело через `io.WriteString`, а ошибку записи только логирует. Она вынесена отдельно, чтобы негативные сценарии можно было проверить тестами (по подсказке из условия).
+
+### 6. Тесты (`coverage_test.go`)
+
+Вспомогательные функции: `newSearchClient` (поднимает `httptest.NewServer` с `SearchServer` и закрывает его через `t.Cleanup`), `withDataset` (подменяет `datasetPath` на время теста), `callServer` (вызывает `SearchServer` напрямую через `httptest.NewRecorder`).
+
+| Тест | Что проверяет |
+|------|---------------|
+| `TestFindUsersSuccess` | 14 сценариев на реальном `dataset.xml`: сортировка по имени, `id` и возрасту в обе стороны, порядок из файла, поиск по `Name` и по `About`, пример из условия, пагинация, ограничение `limit` до 25, `offset` за концом, `limit = 0`; сверяются ID, имена и `NextPage` |
+| `TestFindUsersReturnsFullRecord` | все поля `User` заполнены верно, а не только `ID` и `Name` |
+| `TestFindUsersErrors` | отрицательные `limit` и `offset` (отказывает клиент), неверный токен, неверные `order_field` и `order_by` (отказывает сервер) |
+| `TestFindUsersBrokenExternalSystem` | фейковые серверы: `500`, битый JSON в ответах `400` и `200`, таймаут |
+| `TestFindUsersUnknownError` | сетевая ошибка не по таймауту (неподдерживаемая схема URL) |
+| `TestFindUsersSendsAccessTokenAndParams` | формат запроса: заголовок `AccessToken`, все параметры, `limit + 1` |
+| `TestSearchServerBadParams` | все варианты некорректных параметров дают `400` с нужным текстом |
+| `TestSearchServerUnauthorized` | пустой и неверный токен дают `401` |
+| `TestSearchServerOrderFieldCaseInsensitiveAndOK` | допустимые `order_field` в любом регистре принимаются |
+| `TestSearchServerEmptyResultIsJSONArray` | пустой результат кодируется как `[]`, а не `null` |
+| `TestSearchServerDatasetErrors` | нет файла или битый XML дают `500`, клиент видит `SearchServer fatal error` |
+| `TestSearchServerCustomDataset` | подмена датасета на маленький XML из двух записей, сравнение записей целиком |
+| `TestSendJSONMarshalError`, `TestSendJSONWriteError` | ошибка `json.Marshal` (значение-канал) и ошибка записи в `ResponseWriter` |
+
+Тесты не просто набирают покрытие: сервер реально читает файл и ищет по нему, а ожидаемые результаты (ID, имена, порядок, флаг `NextPage`) заданы в таблицах тестов жёстко.
+
+### 7. Покрытие
+
+Запуск `go test -race -cover` даёт **100% покрытия** операторов; все функции `client.go` (`FindUsers`) и `server.go` (`parseParams`, `loadUsers`, `filterUsers`, `sortUsers`, `paginate`, `sendJSON`, `SearchServer`) покрыты полностью, что выше требуемых 90%.
