@@ -9,6 +9,8 @@ import (
 	"strings"
 )
 
+// kind — укрупнённый тип колонки. Для валидации достаточно трёх вариантов:
+// «string — int — float» (плюс null, который определяется отдельно).
 type kind int
 
 const (
@@ -17,15 +19,19 @@ const (
 	kindFloat
 )
 
+// column описывает одну колонку таблицы. Заполняется один раз при
+// инициализации из результата SHOW FULL COLUMNS.
 type column struct {
 	name     string
 	kind     kind
-	nullable bool
-	primary  bool
-	autoInc  bool
-	hasDef   bool
+	nullable bool // допускает NULL
+	primary  bool // входит в PRIMARY KEY
+	autoInc  bool // AUTO_INCREMENT: при вставке значение генерирует база
+	hasDef   bool // у колонки есть значение по умолчанию
 }
 
+// table описывает таблицу: колонки в порядке объявления, индекс по имени
+// и первичный ключ, по которому работают маршруты /$table/$id.
 type table struct {
 	name    string
 	columns []*column
@@ -33,15 +39,21 @@ type table struct {
 	pk      *column
 }
 
-// explorer живёт в замыкании NewDBExplorer: глобальных переменных нет.
+// explorer хранит всё состояние сервиса. Он живёт в замыкании
+// (метод serve передаётся в http.HandlerFunc), поэтому глобальные
+// переменные не нужны.
 type explorer struct {
 	db     *sql.DB
-	names  []string
-	tables map[string]*table
+	names  []string          // имена таблиц в порядке SHOW TABLES
+	tables map[string]*table // схема каждой таблицы по имени
 }
 
+// result — удобный псевдоним для JSON-объектов в ответах.
 type result map[string]interface{}
 
+// NewDBExplorer читает из базы список таблиц и их структуру, после чего
+// возвращает handler, который работает только с этими данными.
+// Список таблиц считается неизменным на время работы программы.
 func NewDBExplorer(db *sql.DB) (http.Handler, error) {
 	e := &explorer{db: db, tables: map[string]*table{}}
 
@@ -61,6 +73,7 @@ func NewDBExplorer(db *sql.DB) (http.Handler, error) {
 		rows.Close()
 		return nil, err
 	}
+	// Закрываем rows до следующих запросов, чтобы не держать лишнее соединение.
 	rows.Close()
 
 	for _, name := range e.names {
@@ -74,8 +87,9 @@ func NewDBExplorer(db *sql.DB) (http.Handler, error) {
 	return http.HandlerFunc(e.serve), nil
 }
 
+// loadTable загружает структуру одной таблицы через SHOW FULL COLUMNS.
 func (e *explorer) loadTable(name string) (*table, error) {
-	rows, err := e.db.Query("SHOW FULL COLUMNS FROM `" + strings.ReplaceAll(name, "`", "``") + "`")
+	rows, err := e.db.Query("SHOW FULL COLUMNS FROM " + quote(name))
 	if err != nil {
 		return nil, err
 	}
@@ -105,12 +119,15 @@ func (e *explorer) loadTable(name string) (*table, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	// Запасной вариант для таблицы без PRIMARY KEY — первая колонка.
 	if t.pk == nil && len(t.columns) > 0 {
 		t.pk = t.columns[0]
 	}
 	return t, nil
 }
 
+// kindOf определяет kind по SQL-типу колонки (например, "int(11)" или "varchar(255)").
+// Всё, что не число, считаем строкой.
 func kindOf(typ string) kind {
 	typ = strings.ToLower(typ)
 	switch {
@@ -125,7 +142,10 @@ func kindOf(typ string) kind {
 	return kindString
 }
 
-// valid проверяет значение из JSON на соответствие типу колонки.
+// valid проверяет значение, пришедшее из JSON, на соответствие типу колонки.
+// JSON распаковывает любые числа в float64, поэтому для int-колонки
+// дополнительно требуется, чтобы число было целым. nil допустим только
+// для колонок, разрешающих NULL.
 func (c *column) valid(v interface{}) bool {
 	switch x := v.(type) {
 	case nil:
@@ -141,6 +161,8 @@ func (c *column) valid(v interface{}) bool {
 	return false
 }
 
+// zero возвращает нулевое значение для колонки: "" для строк и 0 для чисел.
+// Используется при вставке, если NOT NULL-поле не передали.
 func (c *column) zero() interface{} {
 	if c.kind == kindString {
 		return ""
@@ -148,7 +170,9 @@ func (c *column) zero() interface{} {
 	return 0
 }
 
-// convert приводит значение, прочитанное из базы, к типу JSON.
+// convert приводит значение, прочитанное из базы, к подходящему типу JSON.
+// Драйвер отдаёт текстовые данные как []byte, поэтому числовые колонки
+// разбираем в int64/float64, а остальные — в string. NULL (nil) остаётся nil.
 func (c *column) convert(v interface{}) interface{} {
 	b, ok := v.([]byte)
 	if !ok {
@@ -168,6 +192,11 @@ func (c *column) convert(v interface{}) interface{} {
 	return s
 }
 
+// serve — ручной роутер. Путь делится на части:
+//
+//	/                 — список таблиц
+//	/$table           — список записей (GET) или создание (PUT)
+//	/$table/$id       — чтение (GET), обновление (POST), удаление (DELETE)
 func (e *explorer) serve(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(parts) == 1 && parts[0] == "" {
@@ -217,6 +246,9 @@ func (e *explorer) serve(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// list обрабатывает GET /$table?limit=&offset=.
+// Некорректные или отрицательные limit и offset заменяются значениями
+// по умолчанию (5 и 0); в запрос они попадают только как параметры.
 func (e *explorer) list(w http.ResponseWriter, r *http.Request, t *table) {
 	limit := intParam(r, "limit", 5)
 	offset := intParam(r, "offset", 0)
@@ -229,6 +261,7 @@ func (e *explorer) list(w http.ResponseWriter, r *http.Request, t *table) {
 	writeJSON(w, http.StatusOK, result{"response": result{"records": records}})
 }
 
+// get обрабатывает GET /$table/$id. Если записи нет — 404.
 func (e *explorer) get(w http.ResponseWriter, t *table, id string) {
 	records, err := e.query(t, "SELECT "+columnList(t)+" FROM "+quote(t.name)+" WHERE "+quote(t.pk.name)+" = ?", id)
 	if err != nil {
@@ -242,6 +275,14 @@ func (e *explorer) get(w http.ResponseWriter, t *table, id string) {
 	writeJSON(w, http.StatusOK, result{"response": result{"record": records[0]}})
 }
 
+// create обрабатывает PUT /$table. Правила вставки:
+//   - AUTO_INCREMENT-колонки и неизвестные поля игнорируются;
+//   - переданные значения проверяются на тип (в том числе null);
+//   - непереданные NOT NULL-поля без значения по умолчанию получают
+//     нулевое значение, остальные пропускаются.
+//
+// В ответе возвращается значение первичного ключа новой записи под
+// именем этой колонки.
 func (e *explorer) create(w http.ResponseWriter, r *http.Request, t *table) {
 	body, ok := readBody(w, r)
 	if !ok {
@@ -290,6 +331,10 @@ func (e *explorer) create(w http.ResponseWriter, r *http.Request, t *table) {
 	writeJSON(w, http.StatusOK, result{"response": result{t.pk.name: id}})
 }
 
+// update обрабатывает POST /$table/$id. Обновляются только переданные
+// известные поля. Первичный ключ менять нельзя, как и передавать значение
+// неподходящего типа — в обоих случаях 400 "field X have invalid type".
+// В ответе — количество изменённых строк.
 func (e *explorer) update(w http.ResponseWriter, r *http.Request, t *table, id string) {
 	body, ok := readBody(w, r)
 	if !ok {
@@ -329,6 +374,8 @@ func (e *explorer) update(w http.ResponseWriter, r *http.Request, t *table, id s
 	writeJSON(w, http.StatusOK, result{"response": result{"updated": n}})
 }
 
+// remove обрабатывает DELETE /$table/$id. В ответе — количество удалённых
+// строк (0, если записи не было).
 func (e *explorer) remove(w http.ResponseWriter, t *table, id string) {
 	res, err := e.db.Exec("DELETE FROM "+quote(t.name)+" WHERE "+quote(t.pk.name)+" = ?", id)
 	if err != nil {
@@ -343,14 +390,18 @@ func (e *explorer) remove(w http.ResponseWriter, t *table, id string) {
 	writeJSON(w, http.StatusOK, result{"response": result{"deleted": n}})
 }
 
-// query выполняет запрос и динамически собирает записи по колонкам таблицы.
+// query выполняет SELECT и динамически собирает записи: число и имена
+// полей берутся из схемы таблицы, значения читаются в []interface{} и
+// приводятся к типам JSON через column.convert.
 func (e *explorer) query(t *table, q string, args ...interface{}) ([]map[string]interface{}, error) {
 	rows, err := e.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
+	// rows обязательно закрываем, иначе будут утекать соединения с базой.
 	defer rows.Close()
 
+	// Пустой, но не nil срез, чтобы в JSON получилось [], а не null.
 	records := []map[string]interface{}{}
 	for rows.Next() {
 		vals := make([]interface{}, len(t.columns))
@@ -370,6 +421,7 @@ func (e *explorer) query(t *table, q string, args ...interface{}) ([]map[string]
 	return records, rows.Err()
 }
 
+// columnList возвращает список колонок таблицы для SELECT в порядке схемы.
 func columnList(t *table) string {
 	names := make([]string, len(t.columns))
 	for i, c := range t.columns {
@@ -378,10 +430,15 @@ func columnList(t *table) string {
 	return strings.Join(names, ", ")
 }
 
+// quote экранирует идентификатор (имя таблицы или колонки) обратными
+// кавычками. Идентификаторы берутся только из схемы, но экранируем их
+// на всякий случай.
 func quote(name string) string {
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
 }
 
+// intParam читает неотрицательное целое из query-параметра.
+// Если параметра нет или он некорректен, возвращает def.
 func intParam(r *http.Request, key string, def int) int {
 	n, err := strconv.Atoi(r.URL.Query().Get(key))
 	if err != nil || n < 0 {
@@ -390,6 +447,7 @@ func intParam(r *http.Request, key string, def int) int {
 	return n
 }
 
+// readBody разбирает JSON-тело запроса. При ошибке сам отвечает 400.
 func readBody(w http.ResponseWriter, r *http.Request) (map[string]interface{}, bool) {
 	var body map[string]interface{}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -399,10 +457,13 @@ func readBody(w http.ResponseWriter, r *http.Request) (map[string]interface{}, b
 	return body, true
 }
 
+// writeError отправляет ошибку в формате {"error": "..."}.
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, result{"error": msg})
 }
 
+// writeJSON сериализует v и отправляет его с нужным статусом.
+// Если сериализация не удалась, отвечает 500.
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	data, err := json.Marshal(v)
 	if err != nil {
