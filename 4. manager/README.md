@@ -1,5 +1,7 @@
 # Домашнее задание №4
 
+<img width="883" height="444" alt="Screenshot 2026-11-16 at 19 26 06" src="https://github.com/user-attachments/assets/42841edc-a3e5-4555-9e14-529de173cec9" />
+
 ## Условие
 
 Это простой веб-сервис, представляющий собой менеджер MySQL-базы данных, который позволяет осуществлять CRUD-запросы (create, read, update, delete) к ней по HTTP.
